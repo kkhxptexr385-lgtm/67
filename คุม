@@ -1,0 +1,664 @@
+-- [[ DELTA MOBILE FIX: INTEGRATED TRACKER + ESP + SERVER PLAYER LIST ]] --
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+-- ล้าง UI ตัวเก่าที่อาจจะติดค้างอยู่
+local currentGui = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("DeltaMegaClearTracker")
+if currentGui then currentGui:Destroy() end
+
+-- ==================== คอนฟิกหลัก & สถานะสวิตช์ ====================
+local PLAYER_COLOR = Color3.fromRGB(255, 255, 0)   -- สีเหลือง สำหรับผู้เล่นจริง
+local NPC_COLOR = Color3.fromRGB(255, 255, 255)      -- สีขาว สำหรับ NPC
+local UPDATE_FREQUENCY = 0.1                         -- ความถี่อัปเดตระยะทาง
+
+local playerEspEnabled = true                        -- สวิตช์เปิด-ปิด ESP ผู้เล่น
+local npcEspEnabled = true                           -- สวิตช์เปิด-ปิด ESP NPC
+local serverListEnabled = false                      -- สวิตช์เปิด-ปิด หน้าต่างคัดชื่อผู้เล่น
+
+local ESP_CACHE = {}
+local clientBlockedList = {}
+local currentSpectating = nil
+
+-- ==================== Helper Functions ====================
+local function corner(p, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 8)
+	c.Parent = p
+end
+
+local function stroke(p, col, th)
+	local s = Instance.new("UIStroke")
+	s.Color = col or Color3.fromRGB(60, 60, 75)
+	s.Thickness = th or 1.5
+	s.Parent = p
+end
+
+-- ==================== 1. ตัวควบคุมหลักของ UI ====================
+local sg = Instance.new("ScreenGui", LocalPlayer:WaitForChild("PlayerGui"))
+sg.Name = "DeltaMegaClearTracker"
+sg.ResetOnSpawn = false
+
+local function makeDraggable(frame, dragHandle)
+	local dragging, dragInput, dragStart, startPos
+	dragHandle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end)
+	dragHandle.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+end
+
+-- =======================================================
+-- 🎮 2. แถบปุ่มควบคุมส่วนบน (ปรับขนาดเพิ่มสวิตช์ คัดชื่อ)
+-- =======================================================
+local cp = Instance.new("Frame", sg)
+cp.Size = UDim2.new(0, 480, 0, 32)
+cp.Position = UDim2.new(0.5, -240, 0, 10) -- วางไว้ตรงกลางขอบบนสุดของจอ
+cp.BackgroundTransparency = 1
+
+local cl = Instance.new("UIListLayout", cp)
+cl.FillDirection = Enum.FillDirection.Horizontal
+cl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+cl.Padding = UDim.new(0, 4)
+
+-- ปุ่ม 1: ดูคนตาม
+local b1 = Instance.new("TextButton", cp)
+b1.Size = UDim2.new(0, 85, 1, 0)
+b1.BackgroundColor3 = Color3.fromRGB(0, 120, 200)
+b1.TextColor3 = Color3.fromRGB(255, 255, 255)
+b1.Text = "📊 ดูคนตาม"
+b1.Font = Enum.Font.FredokaOne
+b1.TextSize = 11
+corner(b1, 6)
+
+-- ปุ่ม 2: แผงบล็อก
+local b2 = Instance.new("TextButton", cp)
+b2.Size = UDim2.new(0, 85, 1, 0)
+b2.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+b2.TextColor3 = Color3.fromRGB(255, 255, 255)
+b2.Text = "🚫 แผงบล็อก"
+b2.Font = Enum.Font.FredokaOne
+b2.TextSize = 11
+corner(b2, 6)
+
+-- ปุ่ม 3: สวิตช์ ESP ผู้เล่น
+local b3 = Instance.new("TextButton", cp)
+b3.Size = UDim2.new(0, 95, 1, 0)
+b3.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+b3.TextColor3 = Color3.fromRGB(255, 255, 255)
+b3.Text = "👤 ผู้เล่น: เปิด"
+b3.Font = Enum.Font.FredokaOne
+b3.TextSize = 11
+corner(b3, 6)
+
+-- ปุ่ม 4: สวิตช์ ESP NPC
+local b4 = Instance.new("TextButton", cp)
+b4.Size = UDim2.new(0, 90, 1, 0)
+b4.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+b4.TextColor3 = Color3.fromRGB(255, 255, 255)
+b4.Text = "🤖 NPC: เปิด"
+b4.Font = Enum.Font.FredokaOne
+b4.TextSize = 11
+corner(b4, 6)
+
+-- ปุ่ม 5: สวิตช์ คัดชื่อ (Server List GUI)
+local b5 = Instance.new("TextButton", cp)
+b5.Size = UDim2.new(0, 105, 1, 0)
+b5.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+b5.TextColor3 = Color3.fromRGB(255, 255, 255)
+b5.Text = "📋 คัดชื่อ: ปิด"
+b5.Font = Enum.Font.FredokaOne
+b5.TextSize = 11
+corner(b5, 6)
+
+-- =======================================================
+-- 📊 3. หน้าต่างประวัติแจ้งเตือนเวอร์ชันขยายใหญ่ (ขยับลากได้)
+-- =======================================================
+local tf = Instance.new("Frame", sg)
+tf.Size = UDim2.new(0, 350, 0, 290)
+tf.Position = UDim2.new(0, 25, 0.35, 0)
+tf.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+tf.BackgroundTransparency = 0.15
+tf.Visible = true
+corner(tf, 10)
+
+local tfDrag = Instance.new("Frame", tf)
+tfDrag.Size = UDim2.new(1, 0, 0, 38)
+tfDrag.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+tfDrag.BackgroundTransparency = 0.2
+corner(tfDrag, 10)
+
+local hl = Instance.new("TextLabel", tfDrag)
+hl.Size = UDim2.new(1, -20, 1, 0)
+hl.Position = UDim2.new(0, 12, 0, 0)
+hl.BackgroundTransparency = 1
+hl.TextColor3 = Color3.fromRGB(255, 100, 100)
+hl.Text = "🚨 บันทึกรายชื่อคนนอกแอบตามเพื่อน"
+hl.Font = Enum.Font.FredokaOne
+hl.TextSize = 14
+hl.TextXAlignment = Enum.TextXAlignment.Left
+makeDraggable(tf, tfDrag)
+
+local sc = Instance.new("ScrollingFrame", tf)
+sc.Size = UDim2.new(1, -20, 1, -55)
+sc.Position = UDim2.new(0, 10, 0, 48)
+sc.BackgroundTransparency = 1
+sc.BorderSizePixel = 0
+sc.ScrollBarThickness = 4
+sc.CanvasSize = UDim2.new(0, 0, 0, 0)
+
+local sl = Instance.new("UIListLayout", sc)
+sl.Padding = UDim.new(0, 6)
+
+sl:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	sc.CanvasSize = UDim2.new(0, 0, 0, sl.AbsoluteContentSize.Y)
+end)
+
+-- =======================================================
+-- 🚫 4. หน้าต่างระบบบล็อกแยกต่างหาก
+-- =======================================================
+local bf = Instance.new("Frame", sg)
+bf.Size = UDim2.new(0, 280, 0, 150)
+bf.Position = UDim2.new(0.5, -140, 0.4, -75)
+bf.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+bf.BackgroundTransparency = 0.1
+bf.Visible = false
+corner(bf, 10)
+
+local bfDrag = Instance.new("Frame", bf)
+bfDrag.Size = UDim2.new(1, 0, 0, 35)
+bfDrag.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+corner(bfDrag, 10)
+
+local bhl = Instance.new("TextLabel", bfDrag)
+bhl.Size = UDim2.new(1, 0, 1, 0)
+bhl.BackgroundTransparency = 1
+bhl.TextColor3 = Color3.fromRGB(255, 255, 255)
+bhl.Text = "🚫 แผงคำสั่งบล็อกด่วนเฉพาะเซิร์ฟ"
+bhl.Font = Enum.Font.FredokaOne
+bhl.TextSize = 13
+makeDraggable(bf, bfDrag)
+
+local bi = Instance.new("TextBox", bf)
+bi.Size = UDim2.new(1, -30, 0, 38)
+bi.Position = UDim2.new(0, 15, 0, 52)
+bi.BackgroundColor3 = Color3.fromRGB(55, 55, 60)
+bi.TextColor3 = Color3.fromRGB(255, 255, 255)
+bi.PlaceholderText = "พิมพ์ชื่อไอดีคนที่จะบล็อก..."
+bi.Text = ""
+bi.Font = Enum.Font.FredokaOne
+bi.TextSize = 13
+corner(bi, 6)
+
+local bb = Instance.new("TextButton", bf)
+bb.Size = UDim2.new(1, -30, 0, 38)
+bb.Position = UDim2.new(0, 15, 0, 98)
+bb.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+bb.TextColor3 = Color3.fromRGB(255, 255, 255)
+bb.Text = "🛑 ยืนยันการบล็อก"
+bb.Font = Enum.Font.FredokaOne
+bb.TextSize = 14
+corner(bb, 6)
+
+-- =======================================================
+-- 📋 5. หน้าต่างคัดชื่อผู้เล่นในเซิร์ฟเวอร์ (Server List GUI)
+-- =======================================================
+local mainFrame = Instance.new("Frame", sg)
+mainFrame.Size = UDim2.new(0, 260, 0, 340)
+mainFrame.Position = UDim2.new(0, -300, 0.5, -170) -- ซ่อนอยู่นอกจอด้านซ้ายเป็นค่าเริ่มต้น
+mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+mainFrame.BackgroundTransparency = 0.1
+mainFrame.BorderSizePixel = 0
+mainFrame.ClipsDescendants = true
+corner(mainFrame, 12)
+stroke(mainFrame)
+
+local header = Instance.new("Frame", mainFrame)
+header.Size = UDim2.new(1, 0, 0, 40)
+header.BackgroundColor3 = Color3.fromRGB(28, 28, 35)
+header.BorderSizePixel = 0
+corner(header, 12)
+makeDraggable(mainFrame, header)
+
+local title = Instance.new("TextLabel", header)
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
+title.Text = "Server Players (คัดชื่อ)"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 13
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.BackgroundTransparency = 1
+
+local closeBtn = Instance.new("TextButton", header)
+closeBtn.Size = UDim2.new(0, 26, 0, 26)
+closeBtn.Position = UDim2.new(1, -32, 0.5, -13)
+closeBtn.BackgroundColor3 = Color3.fromRGB(160, 30, 30)
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.TextSize = 11
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.BorderSizePixel = 0
+corner(closeBtn, 6)
+
+local scrollFrame = Instance.new("ScrollingFrame", mainFrame)
+scrollFrame.Size = UDim2.new(1, -12, 1, -50)
+scrollFrame.Position = UDim2.new(0, 6, 0, 44)
+scrollFrame.BackgroundTransparency = 1
+scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollFrame.ScrollBarThickness = 3
+scrollFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 162, 255)
+scrollFrame.BorderSizePixel = 0
+
+local listLayout = Instance.new("UIListLayout", scrollFrame)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding = UDim.new(0, 5)
+
+local function refreshServerList()
+	for _, child in ipairs(scrollFrame:GetChildren()) do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local row = Instance.new("Frame", scrollFrame)
+		row.Size = UDim2.new(1, -2, 0, 38)
+		row.BackgroundColor3 = player == LocalPlayer and Color3.fromRGB(35, 40, 55) or Color3.fromRGB(30, 30, 40)
+		row.BorderSizePixel = 0
+		corner(row, 8)
+
+		if player == LocalPlayer then
+			stroke(row, Color3.fromRGB(0, 162, 255), 1)
+		end
+
+		local nameLabel = Instance.new("TextLabel", row)
+		nameLabel.Size = UDim2.new(1, -115, 1, 0)
+		nameLabel.Position = UDim2.new(0, 10, 0, 0)
+		nameLabel.Text = player.DisplayName
+		nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		nameLabel.TextSize = 11
+		nameLabel.Font = Enum.Font.GothamBold
+		nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+		local copyBtn = Instance.new("TextButton", row)
+		copyBtn.Size = UDim2.new(0, 100, 0, 26)
+		copyBtn.Position = UDim2.new(1, -106, 0.5, -13)
+		copyBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 210)
+		copyBtn.Text = player.Name
+		copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		copyBtn.TextSize = 10
+		copyBtn.Font = Enum.Font.Gotham
+		copyBtn.TextTruncate = Enum.TextTruncate.AtEnd
+		copyBtn.BorderSizePixel = 0
+		corner(copyBtn, 5)
+
+		local playerName = player.Name
+		copyBtn.MouseButton1Click:Connect(function()
+			if setclipboard then
+				setclipboard(playerName)
+			end
+			copyBtn.Text = "Copied!"
+			copyBtn.BackgroundColor3 = Color3.fromRGB(46, 200, 100)
+			task.wait(1.2)
+			copyBtn.Text = playerName
+			copyBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 210)
+		end)
+	end
+
+	scrollFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 5)
+end
+-- =======================================================
+-- 👁️ 6. ระบบ ESP (PLAYER & NPC)
+-- =======================================================
+local function isNPC(model)
+	if not model:IsA("Model") or Players:GetPlayerFromCharacter(model) then return false end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	return hum and hum.Health > 0 and (model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso"))
+end
+
+local function removeESP(model)
+	if ESP_CACHE[model] then
+		local hl = model:FindFirstChild("ESPHighlight")
+		local head = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+		local bb = head and head:FindFirstChild("ESPLabel")
+		if hl then hl:Destroy() end
+		if bb then bb:Destroy() end
+		ESP_CACHE[model] = nil
+	end
+end
+
+local function createESP(model, isPlayer, displayName)
+	if not model or model == LocalPlayer.Character or ESP_CACHE[model] then return end
+	if isPlayer and not playerEspEnabled then return end
+	if not isPlayer and not npcEspEnabled then return end
+
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head") or model:FindFirstChild("Torso")
+	if not hum or not root then return end
+
+	removeESP(model)
+
+	local head = model:FindFirstChild("Head") or root
+	local mainColor = isPlayer and PLAYER_COLOR or NPC_COLOR
+
+	local hl = Instance.new("Highlight")
+	hl.Name = "ESPHighlight"
+	hl.Adornee = model
+	hl.OutlineColor = mainColor
+	hl.FillColor = mainColor
+	hl.FillTransparency = isPlayer and 1 or 0.7
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = model
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ESPLabel"
+	billboard.Size = UDim2.new(0, 300, 0, 80)
+	billboard.StudsOffset = Vector3.new(0, 3, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = math.huge
+	billboard.Adornee = head
+	billboard.Parent = head
+
+	local label = Instance.new("TextLabel", billboard)
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = mainColor
+	label.TextStrokeTransparency = 0
+	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	label.Font = Enum.Font.SourceSansBold
+	label.TextSize = 13
+	label.Text = displayName
+
+	ESP_CACHE[model] = {
+		Label = label,
+		Root = root,
+		Hum = hum,
+		Name = displayName,
+		IsPlayer = isPlayer
+	}
+end
+
+local function clearESPType(isPlayerType)
+	for model, data in pairs(ESP_CACHE) do
+		if data.IsPlayer == isPlayerType then
+			removeESP(model)
+		end
+	end
+end
+
+local function refreshESPType(isPlayerType)
+	if isPlayerType then
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player ~= LocalPlayer and player.Character then
+				createESP(player.Character, true, player.Name)
+			end
+		end
+	else
+		for _, obj in ipairs(Workspace:GetDescendants()) do
+			if isNPC(obj) then
+				createESP(obj, false, obj.Name)
+			end
+		end
+	end
+end
+
+-- =======================================================
+-- ⚙️ 7. ระบบสวิตช์ปุ่มกด & การประมวลผล
+-- =======================================================
+
+-- ปุ่มเปิด/ปิด แผงประวัติ
+local tOpen = true
+b1.MouseButton1Click:Connect(function()
+	tOpen = not tOpen
+	tf.Visible = tOpen
+	b1.BackgroundColor3 = tOpen and Color3.fromRGB(0, 120, 200) or Color3.fromRGB(50, 50, 60)
+end)
+
+-- ปุ่มเปิด/ปิด แผงบล็อก
+local bOpen = false
+b2.MouseButton1Click:Connect(function()
+	bOpen = not bOpen
+	bf.Visible = bOpen
+	b2.BackgroundColor3 = bOpen and Color3.fromRGB(255, 70, 70) or Color3.fromRGB(180, 40, 40)
+end)
+
+-- สวิตช์ ESP ผู้เล่น
+b3.MouseButton1Click:Connect(function()
+	playerEspEnabled = not playerEspEnabled
+	if playerEspEnabled then
+		b3.Text = "👤 ผู้เล่น: เปิด"
+		b3.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+		refreshESPType(true)
+	else
+		b3.Text = "👤 ผู้เล่น: ปิด"
+		b3.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+		clearESPType(true)
+	end
+end)
+
+-- สวิตช์ ESP NPC
+b4.MouseButton1Click:Connect(function()
+	npcEspEnabled = not npcEspEnabled
+	if npcEspEnabled then
+		b4.Text = "🤖 NPC: เปิด"
+		b4.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+		refreshESPType(false)
+	else
+		b4.Text = "🤖 NPC: ปิด"
+		b4.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+		clearESPType(false)
+	end
+end)
+
+-- สวิตช์ คัดชื่อ (Server List GUI)
+local tweenInfo = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+local function toggleServerList()
+	serverListEnabled = not serverListEnabled
+	if serverListEnabled then
+		b5.Text = "📋 คัดชื่อ: เปิด"
+		b5.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+		TweenService:Create(mainFrame, tweenInfo, { Position = UDim2.new(0, 20, 0.5, -170) }):Play()
+		refreshServerList()
+	else
+		b5.Text = "📋 คัดชื่อ: ปิด"
+		b5.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+		TweenService:Create(mainFrame, tweenInfo, { Position = UDim2.new(0, -300, 0.5, -170) }):Play()
+	end
+end
+
+b5.MouseButton1Click:Connect(toggleServerList)
+closeBtn.MouseButton1Click:Connect(toggleServerList)
+
+local function logMessage(text, pName)
+	local item = Instance.new("Frame", sc)
+	item.Size = UDim2.new(1, -5, 0, 42)
+	item.BackgroundColor3 = Color3.fromRGB(50, 35, 35)
+	item.BackgroundTransparency = 0.3
+	corner(item, 6)
+	
+	local lbl = Instance.new("TextLabel", item)
+	lbl.Size = UDim2.new(1, -70, 1, 0)
+	lbl.Position = UDim2.new(0, 10, 0, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = Color3.fromRGB(255, 220, 220)
+	lbl.Text = text
+	lbl.Font = Enum.Font.FredokaOne
+	lbl.TextSize = 13
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	
+	local vBtn = Instance.new("TextButton", item)
+	vBtn.Size = UDim2.new(0, 55, 0, 26)
+	vBtn.Position = UDim2.new(1, -60, 0.5, -13)
+	vBtn.BackgroundColor3 = Color3.fromRGB(0, 130, 180)
+	vBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	vBtn.Text = "ดูตัว"
+	vBtn.Font = Enum.Font.FredokaOne
+	vBtn.TextSize = 12
+	corner(vBtn, 5)
+	
+	vBtn.MouseButton1Click:Connect(function()
+		local p = Players:FindFirstChild(pName)
+		if p and p.Character and p.Character:FindFirstChild("Humanoid") then
+			if currentSpectating == p then
+				if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
+					Camera.CameraSubject = LocalPlayer.Character.Humanoid
+					vBtn.Text = "ดูตัว"
+					vBtn.BackgroundColor3 = Color3.fromRGB(0, 130, 180)
+					currentSpectating = nil
+				end
+			else
+				Camera.CameraSubject = p.Character.Humanoid
+				vBtn.Text = "คืนร่าง"
+				vBtn.BackgroundColor3 = Color3.fromRGB(180, 90, 0)
+				currentSpectating = p
+			end
+		else
+			vBtn.Text = "❌ หลุด"
+			task.wait(1)
+			vBtn.Text = "ดูตัว"
+		end
+	end)
+end
+
+-- ยืนยันบล็อก
+bb.MouseButton1Click:Connect(function()
+	local name = bi.Text
+	if name ~= "" then
+		clientBlockedList[name:lower()] = true
+		logMessage("🛑 บล็อกคุณ " .. name .. " สำเร็จ", name)
+		
+		bi.Text = ""
+		bf.Visible = false
+		bOpen = false
+		b2.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+		
+		local p = Players:FindFirstChild(name)
+		if p then logMessage("🚨 คนที่โดนบล็อกอยู่ในเซิร์ฟเวอร์นี้!", p.Name) end
+	end
+end)
+
+local function isFriend(uId)
+	if not uId or uId == 0 then return false end
+	local s, r = pcall(function() return LocalPlayer:IsFriendsWith(uId) end)
+	return s and r
+end
+
+local function check(p)
+	if not p or p == LocalPlayer then return end
+	task.wait(1.5)
+	
+	if p.Name and clientBlockedList[p.Name:lower()] then
+		logMessage("🚨 คนที่คุณบล็อก (" .. p.Name .. ") อยู่ในเซิร์ฟนี้!", p.Name)
+		return
+	end
+	
+	if isFriend(p.UserId) then return end
+	
+	local s, fId = pcall(function() return p.FollowUserId end)
+	if s and fId and fId ~= 0 then
+		if isFriend(fId) then
+			local sn, tName = pcall(function() return Players:GetNameFromUserIdAsync(fId) end)
+			if sn and tName then
+				logMessage("⚠️ " .. p.Name .. " ตาม -> " .. tName, p.Name)
+			else
+				logMessage("⚠️ " .. p.Name .. " ตามเพื่อนคุณ [ID: " .. fId .. "]", p.Name)
+			end
+		end
+	else
+		logMessage("🚶 " .. p.Name .. " โหลดเข้าเซิร์ฟมาแล้ว", p.Name)
+	end
+end
+
+-- =======================================================
+-- 🔄 8. การเชื่อมต่ออีเวนต์และการลูปอัปเดต
+-- =======================================================
+
+local function setupPlayer(player)
+	if player == LocalPlayer then return end
+	
+	player.CharacterAdded:Connect(function(character)
+		if playerEspEnabled then createESP(character, true, player.Name) end
+	end)
+	
+	if player.Character and playerEspEnabled then
+		createESP(player.Character, true, player.Name)
+	end
+	
+	task.spawn(check, player)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do setupPlayer(p) end
+
+Players.PlayerAdded:Connect(function(p)
+	setupPlayer(p)
+	task.wait(0.2)
+	if serverListEnabled then refreshServerList() end
+end)
+
+Players.PlayerRemoving:Connect(function()
+	task.wait(0.2)
+	if serverListEnabled then refreshServerList() end
+end)
+
+-- ระบบ NPC เกิดใหม่
+Workspace.DescendantAdded:Connect(function(obj)
+	if not npcEspEnabled then return end
+	task.wait(0.1)
+	if isNPC(obj) then
+		createESP(obj, false, obj.Name)
+	end
+end)
+
+for _, obj in ipairs(Workspace:GetDescendants()) do
+	if isNPC(obj) then
+		createESP(obj, false, obj.Name)
+	end
+end
+
+-- ลูปอัปเดตระยะทางแบบประหยัดรีซอร์ส
+task.spawn(function()
+	while true do
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+		if hrp then
+			for model, data in pairs(ESP_CACHE) do
+				if not model:IsDescendantOf(Workspace) or data.Hum.Health <= 0 then
+					removeESP(model)
+				else
+					local dist = (hrp.Position - data.Root.Position).Magnitude
+					if data.IsPlayer then
+						data.Label.Text = string.format("%s [%d m]", data.Name, math.floor(dist))
+					else
+						data.Label.Text = string.format("[NPC] %s [%d m]", data.Name, math.floor(dist))
+					end
+				end
+			end
+		end
+		task.wait(UPDATE_FREQUENCY)
+	end
+end)
